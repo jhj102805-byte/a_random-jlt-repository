@@ -36,10 +36,11 @@ const API_KEY = "b5594f8fc6ed4edabf2da4f0159c1390";
 const REFRESH_MS = 2000;            // live position refresh
 const STALE_S = 90;                 // drop buses not updated for this long (ghosts)
 const SHOW_OUT_OF_SERVICE = false;  // false = hide vehicles that are not on a trip
-const STATIC_MAX_AGE_DAYS = 7;      // static data download is limited to 50/month
+const STATIC_REFRESH_MS = 60000;    // static timetable check (every minute)
 
 const RT_URL = "https://opendata.samtrafiken.se/gtfs-rt/jlt/VehiclePositions.pb?key=" + API_KEY;
-const STATIC_URL = "https://opendata.samtrafiken.se/gtfs/jlt/jlt.zip?key=" + API_KEY;
+const STATIC_KEY = "6515721ae33d422c9c7bdf3047cbec94"; // key for "GTFS Regional Static data" (leave empty to reuse API_KEY)
+const STATIC_URL = "https://opendata.samtrafiken.se/gtfs/jlt/jlt.zip?key=" + (STATIC_KEY || API_KEY);
 
 const PROTO = `
 syntax = "proto2";
@@ -102,10 +103,22 @@ function* rows(text) {
   for (let i = 1; i < lines.length; i++) { const l = lines[i].replace(/\r$/, ""); if (l) yield csvLine(l); }
 }
 
+async function digest(buf) {
+  if (window.crypto && crypto.subtle) {
+    const d = await crypto.subtle.digest("SHA-1", buf);
+    return Array.from(new Uint8Array(d)).map(b => b.toString(16).padStart(2, "0")).join("");
+  }
+  return "len" + buf.byteLength;
+}
+
 async function buildStatic() {
-  const res = await fetch(STATIC_URL);
+  // "no-cache" makes the browser revalidate (conditional GET) instead of blindly reusing its copy
+  const res = await fetch(STATIC_URL, { cache: "no-cache" });
   if (!res.ok) throw new Error("static feed " + res.status);
-  const zip = await JSZip.loadAsync(await res.arrayBuffer());
+  const buf = await res.arrayBuffer();
+  const hash = await digest(buf);
+  if (S && S.hash === hash) return null; // unchanged: skip the heavy parse
+  const zip = await JSZip.loadAsync(buf);
   const routes = {}, trips = {}, heads = [], hmap = {};
 
   let it = rows(await zip.file("routes.txt").async("string"));
@@ -119,28 +132,34 @@ async function buildStatic() {
     if (!(h in hmap)) { hmap[h] = heads.length; heads.push(h); }
     trips[f[ti]] = [f[tr], hmap[h]];
   }
-  return { routes, trips, heads, fetchedAt: Date.now() };
+  return { routes, trips, heads, hash, fetchedAt: Date.now() };
 }
+
+let staticTimer = null;
+function scheduleStatic(ms) { clearTimeout(staticTimer); staticTimer = setTimeout(refreshStatic, ms == null ? STATIC_REFRESH_MS : ms); }
 
 async function refreshStatic() {
   if (staticBusy) return;
-  // hard guard: at most one download attempt per hour, even if it fails or caching is broken
-  const last = +localStorage.getItem("jltStaticTry") || 0;
-  if (Date.now() - last < 36e5) return;
+  if (document.hidden) { scheduleStatic(); return; }
   staticBusy = true;
-  try { localStorage.setItem("jltStaticTry", String(Date.now())); } catch (e) {}
-  setNote("loading line data…");
+  let next = STATIC_REFRESH_MS;
+  if (!S) setNote("loading line data…");
   try {
-    S = await buildStatic();
-    try { await kvSet("static", S); } catch (e) {}
+    const fresh = await buildStatic();
+    if (fresh) { S = fresh; try { await kvSet("static", S); } catch (e) {} }
     setNote("");
-  } catch (e) { console.error(e); setNote("line data unavailable"); }
+  } catch (e) {
+    console.error(e); setNote("line data: " + e.message);
+    // key rejected or quota used up: keep the last good copy and retry in 30 min
+    if (/ (401|403|429)$/.test(e.message)) next = 30 * 60000;
+  }
   staticBusy = false;
+  scheduleStatic(next);
 }
 
 async function initStatic() {
   try { S = (await kvGet("static")) || null; } catch (e) {}
-  if (!S || Date.now() - S.fetchedAt > STATIC_MAX_AGE_DAYS * 864e5) refreshStatic();
+  refreshStatic();
 }
 
 function lookup(v) {
@@ -228,8 +247,6 @@ function apply(feed, hdr) {
   for (const [k, m] of markers) if (m._seen !== hdr) { map.removeLayer(m); markers.delete(k); }
 
   if (!fitted && pts.length) { map.fitBounds(pts, { padding: [40, 40], maxZoom: 14 }); fitted = true; }
-  // timetable changed under us? refresh static (rate-limited inside)
-  if (S && pts.length && unmatched / pts.length > 0.5 && Date.now() - S.fetchedAt > 864e5) refreshStatic();
 
   $("bar").classList.remove("err");
   lastTime = new Date().toLocaleTimeString("sv-SE");
