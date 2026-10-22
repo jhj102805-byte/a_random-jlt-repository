@@ -25,7 +25,7 @@
 </head>
 <body>
 <div id="map"></div>
-<div id="bar"><span id="msg">Loading…</span><span id="count"></span></div>
+<div id="bar"><span><b id="clock"></b> · <span id="msg">Loading…</span></span><span id="count"></span></div>
 <div id="diag" hidden></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
@@ -37,7 +37,7 @@ const API_KEY = "b5594f8fc6ed4edabf2da4f0159c1390";
 // =====================================
 
 // Optional tuning
-const REFRESH_MS = 1200;            // pause between live position requests
+const REFRESH_MS = 2000;            // time between live position requests (2 s = feed's best rate)
 const STALE_S = 90;                 // drop buses not updated for this long (ghosts)
 const SHOW_OUT_OF_SERVICE = false;  // false = hide vehicles that are not on a trip
 // Static timetable (line numbers): fetched once per page load, cached in the browser
@@ -177,15 +177,21 @@ function lookup(v) {
 
 // ---------- live positions ----------
 const markers = new Map();
-let fitted = false, lastTs = 0, timer = null, busy = false, note = "", lastTime = "", lastCount = "", lastMatch = "";
+let fitted = false, lastTs = 0, timer = null, busy = false, note = "", lastTime = "", lastCount = "", lastMatch = "", lastOk = 0, errText = "";
 function setNote(n) { note = n; render(); }
+// Clock + "updated Xs ago" tick on their own timer, independent of feed requests
+function drawStatus() {
+  $("clock").textContent = new Date().toLocaleTimeString("sv-SE");
+  const age = lastOk ? Math.round((Date.now() - lastOk) / 1000) : null;
+  $("msg").textContent = errText || ((age == null ? "Loading…" : "updated " + age + "s ago") + (note ? " · " + note : ""));
+}
 function render() {
-  $("msg").textContent = (lastTime ? "Live · " + lastTime : "Loading…") + (note ? " · " + note : "");
+  drawStatus();
   $("count").textContent = lastCount;
   if (S && S.nt == null) { S.nr = Object.keys(S.routes).length; S.nt = Object.keys(S.trips).length; }
   $("diag").textContent = "Static timetable: " + staticInfo + (S ? " (" + S.nr + " routes, " + S.nt + " trips)" : "") + ". " + lastMatch;
 }
-function fail(t) { $("bar").classList.add("err"); $("msg").textContent = t; $("count").textContent = ""; }
+function fail(t) { $("bar").classList.add("err"); errText = t; $("count").textContent = ""; drawStatus(); }
 function schedule(ms) { clearTimeout(timer); timer = setTimeout(tick, ms == null ? REFRESH_MS : ms); }
 
 async function tick() {
@@ -193,6 +199,7 @@ async function tick() {
   busy = true;
   const ctrl = new AbortController();
   const to = setTimeout(() => ctrl.abort(), 8000);
+  const t0 = Date.now();
   let delay = REFRESH_MS;
   try {
     const res = await fetch(RT_URL, { cache: "no-store", signal: ctrl.signal });
@@ -208,7 +215,9 @@ async function tick() {
     fail("Could not load feed (network or CORS). See console.");
     console.error(err); delay = 10000;
   }
-  clearTimeout(to); busy = false; schedule(delay);
+  clearTimeout(to); busy = false;
+  // keep a steady 2 s rhythm: count from when the request started, not when it finished
+  schedule(delay === REFRESH_MS ? Math.max(200, REFRESH_MS - (Date.now() - t0)) : delay);
 }
 
 function apply(feed, hdr) {
@@ -259,6 +268,7 @@ function apply(feed, hdr) {
   if (!fitted && pts.length) { map.fitBounds(pts, { padding: [40, 40], maxZoom: 14 }); fitted = true; }
 
   $("bar").classList.remove("err");
+  errText = ""; lastOk = Date.now();
   lastTime = new Date().toLocaleTimeString("sv-SE");
   lastCount = pts.length + " buses";
   lastMatch = matched + "/" + pts.length + " matched to a line" + (sampleMiss ? "; unmatched e.g. trip " + sampleMiss : "");
@@ -268,6 +278,8 @@ function apply(feed, hdr) {
 if (API_KEY.startsWith("PASTE")) fail("Set API_KEY at the top of index.html");
 else { initStatic(); tick(); }
 $("bar").addEventListener("click", () => { $("diag").hidden = !$("diag").hidden; });
+setInterval(drawStatus, 250);
+drawStatus();
 document.addEventListener("visibilitychange", () => { if (!document.hidden) schedule(0); });
 </script>
 </body>
