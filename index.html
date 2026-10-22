@@ -17,8 +17,7 @@
     display: flex; justify-content: space-between; gap: 8px;
   }
   #bar.err { background: #fde8e8; color: #7a1010; }
-  .bus { width: 26px; height: 26px; }
-  .bus svg { width: 26px; height: 26px; filter: drop-shadow(0 1px 2px rgba(0,0,0,.5)); }
+  .bus svg { width: 34px; height: 34px; filter: drop-shadow(0 1px 2px rgba(0,0,0,.5)); }
 </style>
 </head>
 <body>
@@ -27,13 +26,20 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/protobufjs/7.2.6/protobuf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script>
 // ====== the one thing to change ======
 const API_KEY = "b5594f8fc6ed4edabf2da4f0159c1390";
 // =====================================
 
-const FEED = "https://opendata.samtrafiken.se/gtfs-rt/jlt/VehiclePositions.pb?key=" + API_KEY;
-const REFRESH_MS = 10000;
+// Optional tuning
+const REFRESH_MS = 2000;            // live position refresh
+const STALE_S = 90;                 // drop buses not updated for this long (ghosts)
+const SHOW_OUT_OF_SERVICE = false;  // false = hide vehicles that are not on a trip
+const STATIC_MAX_AGE_DAYS = 7;      // static data download is limited to 50/month
+
+const RT_URL = "https://opendata.samtrafiken.se/gtfs-rt/jlt/VehiclePositions.pb?key=" + API_KEY;
+const STATIC_URL = "https://opendata.samtrafiken.se/gtfs/jlt/jlt.zip?key=" + API_KEY;
 
 const PROTO = `
 syntax = "proto2";
@@ -47,85 +53,193 @@ message VehiclePosition { optional TripDescriptor trip = 1; optional Position po
 `;
 const FeedMessage = protobuf.parse(PROTO).root.lookupType("FeedMessage");
 
-const map = L.map("map").setView([57.78, 14.16], 12); // Jönköping
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+// ---------- map ----------
+const map = L.map("map").setView([57.78, 14.16], 12);
 L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
   maxZoom: 19,
   attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> | Data: Trafiklab/JLT (CC0)'
 }).addTo(map);
 
-const markers = new Map();
-let fitted = false;
-const bar = document.getElementById("bar");
-const msg = document.getElementById("msg");
-const count = document.getElementById("count");
-
-function icon(bearing) {
-  const rot = bearing == null ? 0 : bearing;
+function icon(label, bearing) {
   const arrow = bearing == null ? "" :
-    `<polygon points="13,1 19,10 7,10" fill="#fff" transform="rotate(${rot} 13 13)"/>`;
+    `<polygon points="17,0 23,9 11,9" fill="#0b6e4f" stroke="#fff" stroke-width="1.5" transform="rotate(${bearing} 17 17)"/>`;
   return L.divIcon({
-    className: "bus", iconSize: [26, 26], iconAnchor: [13, 13],
-    html: `<svg viewBox="0 0 26 26"><circle cx="13" cy="13" r="9" fill="#0b6e4f" stroke="#fff" stroke-width="2"/>${arrow}</svg>`
+    className: "bus", iconSize: [34, 34], iconAnchor: [17, 17],
+    html: `<svg viewBox="0 0 34 34"><circle cx="17" cy="17" r="12" fill="#0b6e4f" stroke="#fff" stroke-width="2"/>${arrow}` +
+          `<text x="17" y="21" text-anchor="middle" font-size="11" font-weight="700" fill="#fff" font-family="system-ui,sans-serif">${esc(label)}</text></svg>`
   });
 }
 
-function popup(v, ageS) {
-  const kmh = v.position.speed != null ? Math.round(v.position.speed * 3.6) + " km/h" : "n/a";
-  const route = v.trip && v.trip.routeId ? v.trip.routeId : "n/a";
-  const label = v.vehicle && (v.vehicle.label || v.vehicle.id) || "n/a";
-  return `Vehicle: ${label}<br>Route id: ${route}<br>Speed: ${kmh}<br>Updated ${ageS}s ago`;
-}
+// ---------- static data (line numbers), cached in IndexedDB ----------
+let S = null, staticBusy = false;
+const idb = () => new Promise((res, rej) => {
+  const r = indexedDB.open("jlt-bus", 1);
+  r.onupgradeneeded = () => r.result.createObjectStore("kv");
+  r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+});
+const kvGet = async k => { const d = await idb(); return new Promise((res, rej) => { const q = d.transaction("kv").objectStore("kv").get(k); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); };
+const kvSet = async (k, v) => { const d = await idb(); return new Promise((res, rej) => { const t = d.transaction("kv", "readwrite"); t.objectStore("kv").put(v, k); t.oncomplete = res; t.onerror = () => rej(t.error); }); };
 
-function fail(text) { bar.classList.add("err"); msg.textContent = text; count.textContent = ""; }
-
-async function refresh() {
-  if (API_KEY.startsWith("PASTE")) { fail("Set API_KEY at the top of index.html"); return; }
-  try {
-    const res = await fetch(FEED, { cache: "no-store" });
-    if (res.status === 401 || res.status === 403) { fail("API key rejected (" + res.status + ")"); return; }
-    if (res.status === 429) { fail("Rate limit hit, retrying…"); return; }
-    if (!res.ok) { fail("Feed error " + res.status); return; }
-    const buf = new Uint8Array(await res.arrayBuffer());
-    const feed = FeedMessage.toObject(FeedMessage.decode(buf), { longs: Number, defaults: false });
-    const now = Math.floor(Date.now() / 1000);
-    const seen = new Set();
-    const pts = [];
-
-    for (const e of feed.entity || []) {
-      const v = e.vehicle;
-      if (!v || !v.position) continue;
-      const id = e.id;
-      const ll = [v.position.latitude, v.position.longitude];
-      const age = v.timestamp ? Math.max(0, now - v.timestamp) : 0;
-      seen.add(id); pts.push(ll);
-      let m = markers.get(id);
-      if (!m) {
-        m = L.marker(ll, { icon: icon(v.position.bearing) }).addTo(map).bindPopup("");
-        markers.set(id, m);
-      } else {
-        m.setLatLng(ll);
-        m.setIcon(icon(v.position.bearing));
-      }
-      m.getPopup().setContent(popup(v, age));
-    }
-    for (const [id, m] of markers) {
-      if (!seen.has(id)) { map.removeLayer(m); markers.delete(id); }
-    }
-    if (!fitted && pts.length) { map.fitBounds(pts, { padding: [40, 40], maxZoom: 14 }); fitted = true; }
-
-    bar.classList.remove("err");
-    msg.textContent = "Live · " + new Date().toLocaleTimeString("sv-SE");
-    count.textContent = pts.length + " buses";
-  } catch (err) {
-    // A network/CORS failure lands here: the browser gives no detail.
-    fail("Could not load feed (network or CORS). See console.");
-    console.error(err);
+function csvLine(line) {
+  const out = []; let cur = "", q = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (q) { if (c === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += c; }
+    else if (c === '"') q = true;
+    else if (c === ",") { out.push(cur); cur = ""; }
+    else cur += c;
   }
+  out.push(cur); return out;
+}
+function* rows(text) {
+  const lines = text.replace(/^\uFEFF/, "").split("\n");
+  const head = csvLine(lines[0].replace(/\r$/, ""));
+  const idx = n => head.indexOf(n);
+  yield idx;
+  for (let i = 1; i < lines.length; i++) { const l = lines[i].replace(/\r$/, ""); if (l) yield csvLine(l); }
 }
 
-refresh();
-setInterval(() => { if (!document.hidden) refresh(); }, REFRESH_MS);
-document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+async function buildStatic() {
+  const res = await fetch(STATIC_URL);
+  if (!res.ok) throw new Error("static feed " + res.status);
+  const zip = await JSZip.loadAsync(await res.arrayBuffer());
+  const routes = {}, trips = {}, heads = [], hmap = {};
+
+  let it = rows(await zip.file("routes.txt").async("string"));
+  let idx = it.next().value; const ri = idx("route_id"), rs = idx("route_short_name"), rl = idx("route_long_name");
+  for (const f of it) routes[f[ri]] = [f[rs] || "", f[rl] || ""];
+
+  it = rows(await zip.file("trips.txt").async("string"));
+  idx = it.next().value; const ti = idx("trip_id"), tr = idx("route_id"), th = idx("trip_headsign");
+  for (const f of it) {
+    const h = th >= 0 ? f[th] || "" : "";
+    if (!(h in hmap)) { hmap[h] = heads.length; heads.push(h); }
+    trips[f[ti]] = [f[tr], hmap[h]];
+  }
+  return { routes, trips, heads, fetchedAt: Date.now() };
+}
+
+async function refreshStatic() {
+  if (staticBusy) return;
+  // hard guard: at most one download attempt per hour, even if it fails or caching is broken
+  const last = +localStorage.getItem("jltStaticTry") || 0;
+  if (Date.now() - last < 36e5) return;
+  staticBusy = true;
+  try { localStorage.setItem("jltStaticTry", String(Date.now())); } catch (e) {}
+  setNote("loading line data…");
+  try {
+    S = await buildStatic();
+    try { await kvSet("static", S); } catch (e) {}
+    setNote("");
+  } catch (e) { console.error(e); setNote("line data unavailable"); }
+  staticBusy = false;
+}
+
+async function initStatic() {
+  try { S = (await kvGet("static")) || null; } catch (e) {}
+  if (!S || Date.now() - S.fetchedAt > STATIC_MAX_AGE_DAYS * 864e5) refreshStatic();
+}
+
+function lookup(v) {
+  const tid = v.trip && v.trip.tripId;
+  const t = S && tid ? S.trips[tid] : null;
+  const rid = (v.trip && v.trip.routeId) || (t && t[0]) || "";
+  const r = S && rid ? S.routes[rid] : null;
+  return { found: !!(t || r), short: (r && r[0]) || "", long: (r && r[1]) || "", head: t ? S.heads[t[1]] : "", rid };
+}
+
+// ---------- live positions ----------
+const markers = new Map();
+let fitted = false, lastTs = 0, timer = null, busy = false, note = "", lastTime = "", lastCount = "";
+function setNote(n) { note = n; render(); }
+function render() { $("msg").textContent = (lastTime ? "Live · " + lastTime : "Loading…") + (note ? " · " + note : ""); $("count").textContent = lastCount; }
+function fail(t) { $("bar").classList.add("err"); $("msg").textContent = t; $("count").textContent = ""; }
+function schedule(ms) { clearTimeout(timer); timer = setTimeout(tick, ms == null ? REFRESH_MS : ms); }
+
+async function tick() {
+  if (document.hidden || busy) { schedule(); return; }
+  busy = true;
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), 8000);
+  let delay = REFRESH_MS;
+  try {
+    const res = await fetch(RT_URL, { cache: "no-store", signal: ctrl.signal });
+    if (res.status === 401 || res.status === 403) { fail("API key rejected (" + res.status + ")"); delay = 30000; }
+    else if (res.status === 429) { fail("Rate or monthly limit hit, backing off"); delay = 30000; }
+    else if (!res.ok) { fail("Feed error " + res.status); delay = 10000; }
+    else {
+      const feed = FeedMessage.toObject(FeedMessage.decode(new Uint8Array(await res.arrayBuffer())), { longs: Number });
+      const hdr = (feed.header && feed.header.timestamp) || Math.floor(Date.now() / 1000);
+      if (hdr >= lastTs) { lastTs = hdr; apply(feed, hdr); }
+    }
+  } catch (err) {
+    fail("Could not load feed (network or CORS). See console.");
+    console.error(err); delay = 10000;
+  }
+  clearTimeout(to); busy = false; schedule(delay);
+}
+
+function apply(feed, hdr) {
+  // 1) drop ghosts, collapse duplicates by vehicle id (newest wins)
+  const byVeh = new Map();
+  for (const e of feed.entity || []) {
+    const v = e.vehicle, p = v && v.position;
+    if (!p || !(p.latitude > 55 && p.latitude < 70 && p.longitude > 10 && p.longitude < 25)) continue;
+    const ts = v.timestamp || hdr;
+    if (hdr - ts > STALE_S) continue;
+    if (!SHOW_OUT_OF_SERVICE && !(v.trip && v.trip.tripId)) continue;
+    const key = (v.vehicle && v.vehicle.id) || e.id;
+    const prev = byVeh.get(key);
+    if (!prev || prev.ts < ts) byVeh.set(key, { key, v, ts });
+  }
+  // 2) the same trip reported by two vehicles: keep the newest
+  const byTrip = new Map();
+  for (const r of byVeh.values()) {
+    const t = r.v.trip;
+    const tk = t && t.tripId ? t.tripId + "|" + (t.startDate || "") : r.key;
+    const prev = byTrip.get(tk);
+    if (!prev || prev.ts < r.ts) byTrip.set(tk, r);
+  }
+
+  let unmatched = 0; const pts = [];
+  for (const r of byTrip.values()) {
+    const { v, ts, key } = r, p = v.position, ll = [p.latitude, p.longitude];
+    const info = lookup(v); if (S && !info.found) unmatched++;
+    const label = info.short || info.rid || "?";
+    const brg = p.bearing == null ? null : Math.round(p.bearing / 10) * 10;
+    const kmh = p.speed != null ? Math.round(p.speed * 3.6) + " km/h" : "n/a";
+    const html = `<b>Line ${esc(label)}</b>${info.long ? " " + esc(info.long) : ""}<br>` +
+      (info.head ? "To " + esc(info.head) + "<br>" : "") +
+      `Speed: ${kmh}<br>Updated ${Math.max(0, hdr - ts)}s ago`;
+    let m = markers.get(key);
+    if (!m) { m = L.marker(ll, { icon: icon(label, brg) }).addTo(map).bindPopup(html); m._sig = label + "|" + brg; markers.set(key, m); }
+    else {
+      m.setLatLng(ll);
+      const sig = label + "|" + brg;
+      if (sig !== m._sig) { m.setIcon(icon(label, brg)); m._sig = sig; }
+      m.getPopup().setContent(html);
+    }
+    m._seen = hdr; pts.push(ll);
+  }
+  // 3) remove anything not in this update
+  for (const [k, m] of markers) if (m._seen !== hdr) { map.removeLayer(m); markers.delete(k); }
+
+  if (!fitted && pts.length) { map.fitBounds(pts, { padding: [40, 40], maxZoom: 14 }); fitted = true; }
+  // timetable changed under us? refresh static (rate-limited inside)
+  if (S && pts.length && unmatched / pts.length > 0.5 && Date.now() - S.fetchedAt > 864e5) refreshStatic();
+
+  $("bar").classList.remove("err");
+  lastTime = new Date().toLocaleTimeString("sv-SE");
+  lastCount = pts.length + " buses";
+  render();
+}
+
+if (API_KEY.startsWith("PASTE")) fail("Set API_KEY at the top of index.html");
+else { initStatic(); tick(); }
+document.addEventListener("visibilitychange", () => { if (!document.hidden) schedule(0); });
 </script>
 </body>
 </html>
