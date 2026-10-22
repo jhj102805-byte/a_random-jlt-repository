@@ -17,12 +17,16 @@
     display: flex; justify-content: space-between; gap: 8px;
   }
   #bar.err { background: #fde8e8; color: #7a1010; }
+  #diag { position: absolute; z-index: 1000; left: 8px; right: 8px; top: calc(env(safe-area-inset-top, 0px) + 56px);
+    background: #fff; color: #1a1a1a; border-radius: 10px; padding: 8px 12px; font-size: 12px; line-height: 1.5;
+    box-shadow: 0 1px 6px rgba(0,0,0,.3); word-break: break-all; }
   .bus svg { width: 34px; height: 34px; filter: drop-shadow(0 1px 2px rgba(0,0,0,.5)); }
 </style>
 </head>
 <body>
 <div id="map"></div>
 <div id="bar"><span id="msg">Loading…</span><span id="count"></span></div>
+<div id="diag" hidden></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/protobufjs/7.2.6/protobuf.min.js"></script>
@@ -33,10 +37,10 @@ const API_KEY = "b5594f8fc6ed4edabf2da4f0159c1390";
 // =====================================
 
 // Optional tuning
-const REFRESH_MS = 2000;            // live position refresh
+const REFRESH_MS = 1200;            // pause between live position requests
 const STALE_S = 90;                 // drop buses not updated for this long (ghosts)
 const SHOW_OUT_OF_SERVICE = false;  // false = hide vehicles that are not on a trip
-const STATIC_REFRESH_MS = 60000;    // static timetable check (every minute)
+// Static timetable (line numbers): fetched once per page load, cached in the browser
 
 const RT_URL = "https://opendata.samtrafiken.se/gtfs-rt/jlt/VehiclePositions.pb?key=" + API_KEY;
 const STATIC_KEY = "6515721ae33d422c9c7bdf3047cbec94"; // key for "GTFS Regional Static data" (leave empty to reuse API_KEY)
@@ -135,46 +139,52 @@ async function buildStatic() {
   return { routes, trips, heads, hash, fetchedAt: Date.now() };
 }
 
-let staticTimer = null;
-function scheduleStatic(ms) { clearTimeout(staticTimer); staticTimer = setTimeout(refreshStatic, ms == null ? STATIC_REFRESH_MS : ms); }
-
+let staticInfo = "not loaded yet";
 async function refreshStatic() {
   if (staticBusy) return;
-  if (document.hidden) { scheduleStatic(); return; }
   staticBusy = true;
-  let next = STATIC_REFRESH_MS;
   if (!S) setNote("loading line data…");
   try {
     const fresh = await buildStatic();
-    if (fresh) { S = fresh; try { await kvSet("static", S); } catch (e) {} }
+    if (fresh) { S = fresh; try { await kvSet("static", S); } catch (e) { console.warn("cache write failed", e); } }
+    try { localStorage.setItem("jltStaticChecked", String(Date.now())); } catch (e) {}
+    staticInfo = "downloaded OK";
     setNote("");
   } catch (e) {
-    console.error(e); setNote("line data: " + e.message);
-    // key rejected or quota used up: keep the last good copy and retry in 30 min
-    if (/ (401|403|429)$/.test(e.message)) next = 30 * 60000;
+    console.error(e); staticInfo = "FAILED: " + e.message;
+    setNote("line data: " + e.message);
   }
-  staticBusy = false;
-  scheduleStatic(next);
+  staticBusy = false; render();
 }
 
 async function initStatic() {
   try { S = (await kvGet("static")) || null; } catch (e) {}
+  if (S) staticInfo = "cached copy";
+  const last = +localStorage.getItem("jltStaticChecked") || 0;
+  if (S && Date.now() - last < 5 * 60000) return; // reload-spam guard: static quota is small
   refreshStatic();
 }
 
 function lookup(v) {
-  const tid = v.trip && v.trip.tripId;
+  const tid = (v.trip && v.trip.tripId) || "";
+  const rtRid = (v.trip && v.trip.routeId) || "";
   const t = S && tid ? S.trips[tid] : null;
-  const rid = (v.trip && v.trip.routeId) || (t && t[0]) || "";
-  const r = S && rid ? S.routes[rid] : null;
-  return { found: !!(t || r), short: (r && r[0]) || "", long: (r && r[1]) || "", head: t ? S.heads[t[1]] : "", rid };
+  // prefer the route from the static trip, fall back to the realtime route_id
+  const r = S ? ((t && S.routes[t[0]]) || (rtRid && S.routes[rtRid]) || null) : null;
+  return { found: !!(t || r), short: (r && r[0]) || "", long: (r && r[1]) || "",
+           head: t ? S.heads[t[1]] : "", rid: (t && t[0]) || rtRid, tid };
 }
 
 // ---------- live positions ----------
 const markers = new Map();
-let fitted = false, lastTs = 0, timer = null, busy = false, note = "", lastTime = "", lastCount = "";
+let fitted = false, lastTs = 0, timer = null, busy = false, note = "", lastTime = "", lastCount = "", lastMatch = "";
 function setNote(n) { note = n; render(); }
-function render() { $("msg").textContent = (lastTime ? "Live · " + lastTime : "Loading…") + (note ? " · " + note : ""); $("count").textContent = lastCount; }
+function render() {
+  $("msg").textContent = (lastTime ? "Live · " + lastTime : "Loading…") + (note ? " · " + note : "");
+  $("count").textContent = lastCount;
+  if (S && S.nt == null) { S.nr = Object.keys(S.routes).length; S.nt = Object.keys(S.trips).length; }
+  $("diag").textContent = "Static timetable: " + staticInfo + (S ? " (" + S.nr + " routes, " + S.nt + " trips)" : "") + ". " + lastMatch;
+}
 function fail(t) { $("bar").classList.add("err"); $("msg").textContent = t; $("count").textContent = ""; }
 function schedule(ms) { clearTimeout(timer); timer = setTimeout(tick, ms == null ? REFRESH_MS : ms); }
 
@@ -223,16 +233,16 @@ function apply(feed, hdr) {
     if (!prev || prev.ts < r.ts) byTrip.set(tk, r);
   }
 
-  let unmatched = 0; const pts = [];
+  let matched = 0, sampleMiss = ""; const pts = [];
   for (const r of byTrip.values()) {
     const { v, ts, key } = r, p = v.position, ll = [p.latitude, p.longitude];
-    const info = lookup(v); if (S && !info.found) unmatched++;
-    const label = info.short || info.rid || "?";
+    const info = lookup(v); if (info.found) matched++; else if (!sampleMiss) sampleMiss = info.tid + " / route " + info.rid;
+    const label = String(info.short || info.long || info.rid || "?").slice(0, 4);
     const brg = p.bearing == null ? null : Math.round(p.bearing / 10) * 10;
     const kmh = p.speed != null ? Math.round(p.speed * 3.6) + " km/h" : "n/a";
     const html = `<b>Line ${esc(label)}</b>${info.long ? " " + esc(info.long) : ""}<br>` +
       (info.head ? "To " + esc(info.head) + "<br>" : "") +
-      `Speed: ${kmh}<br>Updated ${Math.max(0, hdr - ts)}s ago`;
+      `Speed: ${kmh}<br>Updated ${Math.max(0, hdr - ts)}s ago<br><small>trip ${esc(info.tid)} · route ${esc(info.rid)}</small>`;
     let m = markers.get(key);
     if (!m) { m = L.marker(ll, { icon: icon(label, brg) }).addTo(map).bindPopup(html); m._sig = label + "|" + brg; markers.set(key, m); }
     else {
@@ -251,11 +261,13 @@ function apply(feed, hdr) {
   $("bar").classList.remove("err");
   lastTime = new Date().toLocaleTimeString("sv-SE");
   lastCount = pts.length + " buses";
+  lastMatch = matched + "/" + pts.length + " matched to a line" + (sampleMiss ? "; unmatched e.g. trip " + sampleMiss : "");
   render();
 }
 
 if (API_KEY.startsWith("PASTE")) fail("Set API_KEY at the top of index.html");
 else { initStatic(); tick(); }
+$("bar").addEventListener("click", () => { $("diag").hidden = !$("diag").hidden; });
 document.addEventListener("visibilitychange", () => { if (!document.hidden) schedule(0); });
 </script>
 </body>
