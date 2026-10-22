@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>JLT live buses</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<style>
+  html, body { height: 100%; margin: 0; }
+  body { font-family: system-ui, -apple-system, sans-serif; }
+  #map { position: absolute; inset: 0; }
+  #bar {
+    position: absolute; z-index: 1000; left: 8px; right: 8px;
+    top: calc(env(safe-area-inset-top, 0px) + 8px);
+    background: #fff; color: #1a1a1a; border-radius: 10px; padding: 8px 12px;
+    font-size: 14px; box-shadow: 0 1px 6px rgba(0,0,0,.3);
+    display: flex; justify-content: space-between; gap: 8px;
+  }
+  #bar.err { background: #fde8e8; color: #7a1010; }
+  .bus { width: 26px; height: 26px; }
+  .bus svg { width: 26px; height: 26px; filter: drop-shadow(0 1px 2px rgba(0,0,0,.5)); }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="bar"><span id="msg">Loading…</span><span id="count"></span></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/protobufjs/7.2.6/protobuf.min.js"></script>
+<script>
+// ====== the one thing to change ======
+const API_KEY = "b5594f8fc6ed4edabf2da4f0159c1390";
+// =====================================
+
+const FEED = "https://opendata.samtrafiken.se/gtfs-rt/jlt/VehiclePositions.pb?key=" + API_KEY;
+const REFRESH_MS = 10000;
+
+const PROTO = `
+syntax = "proto2";
+message FeedMessage { required FeedHeader header = 1; repeated FeedEntity entity = 2; }
+message FeedHeader { required string gtfs_realtime_version = 1; optional uint64 timestamp = 3; }
+message FeedEntity { required string id = 1; optional VehiclePosition vehicle = 4; }
+message TripDescriptor { optional string trip_id = 1; optional string start_time = 2; optional string start_date = 3; optional string route_id = 5; optional uint32 direction_id = 6; }
+message VehicleDescriptor { optional string id = 1; optional string label = 2; optional string license_plate = 3; }
+message Position { required float latitude = 1; required float longitude = 2; optional float bearing = 3; optional double odometer = 4; optional float speed = 5; }
+message VehiclePosition { optional TripDescriptor trip = 1; optional Position position = 2; optional uint32 current_stop_sequence = 3; optional string stop_id = 7; optional uint64 timestamp = 5; optional VehicleDescriptor vehicle = 8; }
+`;
+const FeedMessage = protobuf.parse(PROTO).root.lookupType("FeedMessage");
+
+const map = L.map("map").setView([57.78, 14.16], 12); // Jönköping
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19,
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> | Data: Trafiklab/JLT (CC0)'
+}).addTo(map);
+
+const markers = new Map();
+let fitted = false;
+const bar = document.getElementById("bar");
+const msg = document.getElementById("msg");
+const count = document.getElementById("count");
+
+function icon(bearing) {
+  const rot = bearing == null ? 0 : bearing;
+  const arrow = bearing == null ? "" :
+    `<polygon points="13,1 19,10 7,10" fill="#fff" transform="rotate(${rot} 13 13)"/>`;
+  return L.divIcon({
+    className: "bus", iconSize: [26, 26], iconAnchor: [13, 13],
+    html: `<svg viewBox="0 0 26 26"><circle cx="13" cy="13" r="9" fill="#0b6e4f" stroke="#fff" stroke-width="2"/>${arrow}</svg>`
+  });
+}
+
+function popup(v, ageS) {
+  const kmh = v.position.speed != null ? Math.round(v.position.speed * 3.6) + " km/h" : "n/a";
+  const route = v.trip && v.trip.routeId ? v.trip.routeId : "n/a";
+  const label = v.vehicle && (v.vehicle.label || v.vehicle.id) || "n/a";
+  return `Vehicle: ${label}<br>Route id: ${route}<br>Speed: ${kmh}<br>Updated ${ageS}s ago`;
+}
+
+function fail(text) { bar.classList.add("err"); msg.textContent = text; count.textContent = ""; }
+
+async function refresh() {
+  if (API_KEY.startsWith("PASTE")) { fail("Set API_KEY at the top of index.html"); return; }
+  try {
+    const res = await fetch(FEED, { cache: "no-store" });
+    if (res.status === 401 || res.status === 403) { fail("API key rejected (" + res.status + ")"); return; }
+    if (res.status === 429) { fail("Rate limit hit, retrying…"); return; }
+    if (!res.ok) { fail("Feed error " + res.status); return; }
+    const buf = new Uint8Array(await res.arrayBuffer());
+    const feed = FeedMessage.toObject(FeedMessage.decode(buf), { longs: Number, defaults: false });
+    const now = Math.floor(Date.now() / 1000);
+    const seen = new Set();
+    const pts = [];
+
+    for (const e of feed.entity || []) {
+      const v = e.vehicle;
+      if (!v || !v.position) continue;
+      const id = e.id;
+      const ll = [v.position.latitude, v.position.longitude];
+      const age = v.timestamp ? Math.max(0, now - v.timestamp) : 0;
+      seen.add(id); pts.push(ll);
+      let m = markers.get(id);
+      if (!m) {
+        m = L.marker(ll, { icon: icon(v.position.bearing) }).addTo(map).bindPopup("");
+        markers.set(id, m);
+      } else {
+        m.setLatLng(ll);
+        m.setIcon(icon(v.position.bearing));
+      }
+      m.getPopup().setContent(popup(v, age));
+    }
+    for (const [id, m] of markers) {
+      if (!seen.has(id)) { map.removeLayer(m); markers.delete(id); }
+    }
+    if (!fitted && pts.length) { map.fitBounds(pts, { padding: [40, 40], maxZoom: 14 }); fitted = true; }
+
+    bar.classList.remove("err");
+    msg.textContent = "Live · " + new Date().toLocaleTimeString("sv-SE");
+    count.textContent = pts.length + " buses";
+  } catch (err) {
+    // A network/CORS failure lands here: the browser gives no detail.
+    fail("Could not load feed (network or CORS). See console.");
+    console.error(err);
+  }
+}
+
+refresh();
+setInterval(() => { if (!document.hidden) refresh(); }, REFRESH_MS);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+</script>
+</body>
+</html>
